@@ -251,7 +251,9 @@ export function App() {
   const [selectedPeriod, setSelectedPeriod] = useState('3M');
   const [selectedForecastPeriod, setSelectedForecastPeriod] = useState<ForecastPeriod>('90일');
   const [lastUpdate, setLastUpdate] = useState(new Date());
+  const [lastSyncTime, setLastSyncTime] = useState(new Date());
   const [isLoading, setIsLoading] = useState(false);
+  const [refreshStatus, setRefreshStatus] = useState<'idle' | 'success' | 'error'>('idle');
   const [realData, setRealData] = useState<any>(null);
   const [isDarkMode, setIsDarkMode] = useState(true);
   const activeTheme = fixedAccentTheme;
@@ -281,7 +283,12 @@ export function App() {
 
   const fetchPredictionData = async () => {
     try {
-      const response = await fetch('/full_prediction.json');
+      const response = await fetch(`/full_prediction.json?t=${Date.now()}`, {
+        cache: 'no-store',
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
       const data = await response.json();
       setRealData(data);
 
@@ -290,20 +297,26 @@ export function App() {
       }
 
       setLastUpdate(new Date(data.last_update || new Date()));
+      setLastSyncTime(new Date());
+      return true;
     } catch (error) {
       console.error('Failed to fetch prediction data:', error);
+      return false;
     }
   };
 
   const handleRefresh = async () => {
     setIsLoading(true);
-    await fetchPredictionData();
+    const ok = await fetchPredictionData();
+    setRefreshStatus(ok ? 'success' : 'error');
     setIsLoading(false);
   };
 
   useEffect(() => {
     fetchPredictionData();
-    const interval = setInterval(handleRefresh, 5 * 60 * 1000);
+    const interval = setInterval(() => {
+      fetchPredictionData();
+    }, 5 * 60 * 1000);
     return () => clearInterval(interval);
   }, []);
 
@@ -580,6 +593,7 @@ export function App() {
           <div>
             <h2 className="text-xl font-bold">KOSPI 365일 예측 차트</h2>
             <p className="text-slate-400 text-sm">{lastUpdate.toLocaleDateString('ko-KR')} 기준 · 신뢰구간: 68%/95%</p>
+            <p className="text-slate-500 text-xs mt-1">마지막 동기화: {lastSyncTime.toLocaleString('ko-KR')}</p>
           </div>
           <div className="flex gap-2">
             {['1M', '3M', '1Y', '5Y', 'All'].map((period) => (
@@ -660,8 +674,14 @@ export function App() {
             {realData?.daily_change >= 0 ? <TrendingUp className="w-4 h-4 text-emerald-400" /> : <TrendingDown className="w-4 h-4 text-red-400" />}
           </div>
           <div className="mt-2 text-xs text-slate-500">
-            {lastUpdate.toLocaleString('ko-KR')}
+            데이터 기준: {lastUpdate.toLocaleString('ko-KR')}
           </div>
+          {refreshStatus === 'success' && (
+            <div className="mt-1 text-xs text-emerald-400">수동 새로고침 완료</div>
+          )}
+          {refreshStatus === 'error' && (
+            <div className="mt-1 text-xs text-red-400">수동 새로고침 실패</div>
+          )}
         </div>
 
         {/* Forecast Cards */}
