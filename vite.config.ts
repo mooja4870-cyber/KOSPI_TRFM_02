@@ -11,6 +11,15 @@ const __dirname = path.dirname(__filename);
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react(), tailwindcss(), viteSingleFile()],
+  server: {
+    proxy: {
+      "/naver-api": {
+        target: "https://m.stock.naver.com",
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/naver-api/, ""),
+      },
+    },
+  },
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "src"),

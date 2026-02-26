@@ -10,13 +10,64 @@ const toFiniteNumber = (value: unknown, fallback: number) => {
   return Number.isFinite(num) ? num : fallback;
 };
 
+const toNumericWithComma = (value: unknown, fallback: number) => {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : fallback;
+  if (typeof value === 'string') {
+    const parsed = Number(value.replaceAll(',', ''));
+    return Number.isFinite(parsed) ? parsed : fallback;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const isValidDate = (value: string | undefined) => {
+  if (!value) return false;
+  const dt = new Date(value);
+  return !Number.isNaN(dt.getTime());
+};
+
+const toIsoDate = (date: Date) => date.toISOString().slice(0, 10);
+
+const addDays = (baseDate: Date, days: number) => {
+  const next = new Date(baseDate);
+  next.setDate(next.getDate() + days);
+  return next;
+};
+
+const toAxisDateLabel = (value: string) => {
+  if (!isValidDate(value)) return value;
+  const dt = new Date(value);
+  return `${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`;
+};
+
 const buildChartSeries = (historyInput: any[] = [], forecastInput: any[] = [], fallbackBasePrice = 6083.86) => {
-  const history = historyInput.map((item) => ({ ...item }));
+  const history = historyInput.map((item, idx) => {
+    const rawDate = typeof item?.date === 'string' ? item.date : '';
+    const normalizedDate = isValidDate(rawDate) ? toIsoDate(new Date(rawDate)) : `hist-${idx + 1}`;
+    return {
+      ...item,
+      date: normalizedDate,
+      axisLabel: toAxisDateLabel(normalizedDate),
+      forecastDay: null,
+    };
+  });
+
+  const lastHistoryDate = history.length > 0 && isValidDate(history[history.length - 1]?.date)
+    ? new Date(history[history.length - 1].date)
+    : new Date();
+
   const normalizedForecast = forecastInput.map((item, idx) => {
     const day = idx + 1;
     const forecastValue = toFiniteNumber(item?.forecast, toFiniteNumber(item?.actual, fallbackBasePrice));
+    const rawDate = typeof item?.date === 'string' ? item.date : '';
+    const normalizedDate = isValidDate(rawDate)
+      ? toIsoDate(new Date(rawDate))
+      : toIsoDate(addDays(lastHistoryDate, day));
+
     return {
-      date: CHART_LABEL_DAYS.has(day) ? `+${day}일` : '',
+      date: normalizedDate,
+      axisLabel: CHART_LABEL_DAYS.has(day) ? `+${day}일` : '',
+      forecastDay: day,
       actual: null,
       forecast: Math.round(forecastValue),
       lower68: toFiniteNumber(item?.lower68, Math.round(forecastValue - (25 + day * 0.7))),
@@ -44,7 +95,9 @@ const buildChartSeries = (historyInput: any[] = [], forecastInput: any[] = [], f
     lastForecast = Math.round(lastForecast + drift + seasonal);
     lastStep = drift;
     clampedForecast.push({
-      date: CHART_LABEL_DAYS.has(day) ? `+${day}일` : '',
+      date: toIsoDate(addDays(lastHistoryDate, day)),
+      axisLabel: CHART_LABEL_DAYS.has(day) ? `+${day}일` : '',
+      forecastDay: day,
       actual: null,
       forecast: lastForecast,
       lower68: lastForecast - Math.round(25 + day * 0.7),
@@ -54,12 +107,7 @@ const buildChartSeries = (historyInput: any[] = [], forecastInput: any[] = [], f
     });
   }
 
-  const finalizedForecast = clampedForecast.map((item, idx) => ({
-    ...item,
-    date: CHART_LABEL_DAYS.has(idx + 1) ? `+${idx + 1}일` : '',
-  }));
-
-  return [...history, ...finalizedForecast];
+  return [...history, ...clampedForecast];
 };
 
 // Generate mock forecast data for initial state
@@ -91,10 +139,10 @@ const generateForecastData = (startingPrice = 6083.86) => {
     const noise = (Math.random() - 0.5) * 20;
     const forecast = Math.round(startingPrice + trend + volatility + noise);
 
-    const isForecastDay = forecastDays.includes(i);
-
     data.push({
-      date: isForecastDay ? `+${i}일` : '',
+      date: toIsoDate(addDays(new Date(), i)),
+      axisLabel: forecastDays.includes(i) ? `+${i}일` : '',
+      forecastDay: i,
       actual: null,
       forecast: forecast,
       lower68: forecast - Math.round(25 + i * 0.7),
@@ -171,6 +219,13 @@ const modelConfidence = [
 ];
 
 type ForecastPeriod = '3일' | '15일' | '30일' | '60일' | '90일' | '180일' | '365일';
+type LiveQuote = {
+  current_price: number;
+  daily_change: number;
+  daily_pct: number;
+  traded_at: string;
+  source: string;
+};
 
 const forecastPeriods: ForecastPeriod[] = ['3일', '15일', '30일', '60일', '90일', '180일', '365일'];
 
@@ -255,6 +310,7 @@ export function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [refreshStatus, setRefreshStatus] = useState<'idle' | 'success' | 'error'>('idle');
   const [realData, setRealData] = useState<any>(null);
+  const [liveQuote, setLiveQuote] = useState<LiveQuote | null>(null);
   const [isDarkMode, setIsDarkMode] = useState(true);
   const activeTheme = fixedAccentTheme;
 
@@ -305,22 +361,78 @@ export function App() {
     }
   };
 
+  const fetchRealtimeQuote = async () => {
+    try {
+      const response = await fetch(`/naver-api/api/index/KOSPI/price?t=${Date.now()}`, {
+        cache: 'no-store',
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const payload = await response.json();
+      const latest = Array.isArray(payload) ? payload[0] : null;
+      if (!latest) {
+        throw new Error('No realtime quote payload');
+      }
+
+      setLiveQuote({
+        current_price: toNumericWithComma(latest?.closePrice, 0),
+        daily_change: toNumericWithComma(latest?.compareToPreviousClosePrice, 0),
+        daily_pct: toNumericWithComma(latest?.fluctuationsRatio, 0),
+        traded_at: String(latest?.localTradedAt || ''),
+        source: 'Naver Index API',
+      });
+
+      setLastSyncTime(new Date());
+      return true;
+    } catch (error) {
+      console.error('Failed to fetch realtime KOSPI quote:', error);
+      return false;
+    }
+  };
+
   const handleRefresh = async () => {
     setIsLoading(true);
-    const ok = await fetchPredictionData();
-    setRefreshStatus(ok ? 'success' : 'error');
+    const [predictionOk, quoteOk] = await Promise.all([fetchPredictionData(), fetchRealtimeQuote()]);
+    setRefreshStatus(predictionOk || quoteOk ? 'success' : 'error');
     setIsLoading(false);
   };
 
   useEffect(() => {
     fetchPredictionData();
-    const interval = setInterval(() => {
+    fetchRealtimeQuote();
+
+    const predictionInterval = setInterval(() => {
       fetchPredictionData();
     }, 5 * 60 * 1000);
-    return () => clearInterval(interval);
+
+    let realtimeInterval: ReturnType<typeof setInterval> | null = null;
+
+    const scheduleRealtimeAtMinuteBoundary = () => {
+      const now = new Date();
+      const delayMs = (60 - now.getSeconds()) * 1000 - now.getMilliseconds();
+      return setTimeout(() => {
+        fetchRealtimeQuote();
+        realtimeInterval = setInterval(() => {
+          fetchRealtimeQuote();
+        }, 60 * 1000);
+      }, Math.max(delayMs, 0));
+    };
+
+    const minuteTimer = scheduleRealtimeAtMinuteBoundary();
+
+    return () => {
+      clearInterval(predictionInterval);
+      clearTimeout(minuteTimer);
+      if (realtimeInterval) {
+        clearInterval(realtimeInterval);
+      }
+    };
   }, []);
 
-  const currentPrice = Number(realData?.current_price || 6083.86);
+  const currentPrice = Number(liveQuote?.current_price ?? realData?.current_price ?? 6083.86);
+  const dailyChange = Number(liveQuote?.daily_change ?? realData?.daily_change ?? 114.22);
+  const dailyPct = Number(liveQuote?.daily_pct ?? realData?.daily_pct ?? 1.91);
 
   const fallbackMilestones = {
     '30d': { price: 6250, change_pct: 2.7, uncertainty: 120 },
@@ -383,6 +495,45 @@ export function App() {
       color: ['#3B82F6', '#10B981', '#F59E0B', '#EF4444', '#8B5CF6'][i % 5]
     }))
     : generateFeatureImportance();
+
+  const chartForecastDays = selectedPeriod === '1M'
+    ? 30
+    : selectedPeriod === '3M'
+      ? 90
+      : CHART_FORECAST_DAYS;
+  const historySeries = forecastData.filter((point: any) => point.actual !== null && point.actual !== undefined);
+  const forecastSeries = forecastData.filter((point: any) => point.actual === null || point.actual === undefined);
+
+  let historyLen = historySeries.length;
+  if (selectedPeriod !== 'All') {
+    if (selectedPeriod === '1M') historyLen = 22;
+    else if (selectedPeriod === '3M') historyLen = 66;
+    else if (selectedPeriod === '1Y') historyLen = 252;
+    else if (selectedPeriod === '5Y') historyLen = 252 * 5;
+  }
+
+  const visibleHistory = selectedPeriod === 'All'
+    ? historySeries
+    : historySeries.slice(-historyLen);
+
+  const visibleForecast = forecastSeries
+    .slice(0, chartForecastDays)
+    .map((point: any, idx: number) => {
+      const day = idx + 1;
+      const isShortHorizon = chartForecastDays <= 15;
+      const shouldLabel = isShortHorizon || CHART_LABEL_DAYS.has(day) || day === chartForecastDays;
+
+      return {
+        ...point,
+        axisLabel: shouldLabel ? `+${day}일` : '',
+      };
+    });
+
+  const chartData = [...visibleHistory, ...visibleForecast];
+  const axisLabelByDate = chartData.reduce((acc: Record<string, string>, point: any) => {
+    acc[String(point.date)] = point.axisLabel || toAxisDateLabel(String(point.date));
+    return acc;
+  }, {});
 
   const selectedForecast = forecasts[selectedForecastPeriod];
   const selectedViewConfig = periodViewConfig[selectedForecastPeriod];
@@ -591,7 +742,7 @@ export function App() {
       <div className={`${sectionThemeClass} rounded-2xl p-6 mb-8`}>
         <div className="flex items-center justify-between mb-6">
           <div>
-            <h2 className="text-xl font-bold">KOSPI 365일 예측 차트</h2>
+            <h2 className="text-xl font-bold">KOSPI {chartForecastDays}일 예측 차트</h2>
             <p className="text-slate-400 text-sm">{lastUpdate.toLocaleDateString('ko-KR')} 기준 · 신뢰구간: 68%/95%</p>
             <p className="text-slate-500 text-xs mt-1">마지막 동기화: {lastSyncTime.toLocaleString('ko-KR')}</p>
           </div>
@@ -610,18 +761,7 @@ export function App() {
         </div>
         <div className="h-96">
           <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={(() => {
-              if (selectedPeriod === 'All') return forecastData;
-
-              const forecastLen = CHART_FORECAST_DAYS;
-              let historyLen = 0;
-              if (selectedPeriod === '1M') historyLen = 22;
-              else if (selectedPeriod === '3M') historyLen = 66;
-              else if (selectedPeriod === '1Y') historyLen = 252;
-              else if (selectedPeriod === '5Y') historyLen = 252 * 5;
-
-              return forecastData.slice(-(historyLen + forecastLen));
-            })()}>
+            <AreaChart data={chartData}>
               <defs>
                 <linearGradient id="colorForecast" x1="0" y1="0" x2="0" y2="1">
                   <stop offset="5%" stopColor="#3B82F6" stopOpacity={0.3} />
@@ -638,11 +778,17 @@ export function App() {
                 stroke="#9CA3AF"
                 tick={{ fontSize: 10 }}
                 minTickGap={50}
+                tickFormatter={(value) => axisLabelByDate[String(value)] ?? String(value)}
               />
               <YAxis domain={['dataMin - 100', 'dataMax + 100']} stroke="#9CA3AF" tick={{ fontSize: 12 }} />
               <Tooltip
                 contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151', borderRadius: '8px' }}
                 labelStyle={{ color: '#9CA3AF' }}
+                labelFormatter={(label, payload) => {
+                  const day = payload?.[0]?.payload?.forecastDay;
+                  if (day) return `+${day}일 (${label})`;
+                  return `${label}`;
+                }}
               />
               <Legend />
               <Area type="monotone" dataKey="upper95" stroke="none" fill="#60A5FA" fillOpacity={0.1} />
@@ -665,16 +811,18 @@ export function App() {
             <Activity className="w-5 h-5 text-cyan-400" />
           </div>
           <div className="text-4xl font-bold mb-1">
-            {realData ? realData.current_price.toLocaleString() : '6,083.86'}
+            {currentPrice.toLocaleString()}
           </div>
           <div className="flex items-center gap-2">
-            <span className={realData?.daily_change >= 0 ? 'text-emerald-400 text-sm' : 'text-red-400 text-sm'}>
-              {realData ? `${realData.daily_change >= 0 ? '+' : ''}${realData.daily_change.toLocaleString()} (${realData.daily_pct >= 0 ? '+' : ''}${realData.daily_pct}%)` : '+114.22 (+1.91%)'}
+            <span className={dailyChange >= 0 ? 'text-emerald-400 text-sm' : 'text-red-400 text-sm'}>
+              {`${dailyChange >= 0 ? '+' : ''}${dailyChange.toLocaleString()} (${dailyPct >= 0 ? '+' : ''}${dailyPct}%)`}
             </span>
-            {realData?.daily_change >= 0 ? <TrendingUp className="w-4 h-4 text-emerald-400" /> : <TrendingDown className="w-4 h-4 text-red-400" />}
+            {dailyChange >= 0 ? <TrendingUp className="w-4 h-4 text-emerald-400" /> : <TrendingDown className="w-4 h-4 text-red-400" />}
           </div>
           <div className="mt-2 text-xs text-slate-500">
-            데이터 기준: {lastUpdate.toLocaleString('ko-KR')}
+            {liveQuote?.traded_at
+              ? `실시간 기준: ${liveQuote.traded_at} (${liveQuote.source})`
+              : `데이터 기준: ${lastUpdate.toLocaleString('ko-KR')}`}
           </div>
           {refreshStatus === 'success' && (
             <div className="mt-1 text-xs text-emerald-400">수동 새로고침 완료</div>

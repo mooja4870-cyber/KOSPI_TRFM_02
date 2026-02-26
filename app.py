@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 DATA_PATH = Path(__file__).parent / "public" / "full_prediction.json"
+REALTIME_KOSPI_URL = "https://m.stock.naver.com/api/index/KOSPI/price"
 
 
 @st.cache_data(show_spinner=False)
@@ -37,6 +41,42 @@ def load_prediction_data(path: Path):
 
 def signed(value: float) -> str:
     return f"{value:+,.2f}"
+
+
+def _to_float(value: str | int | float | None) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    return float(str(value).replace(",", ""))
+
+
+@st.cache_data(show_spinner=False, ttl=15)
+def load_realtime_kospi_quote():
+    req = Request(
+        REALTIME_KOSPI_URL,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urlopen(req, timeout=5) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except (URLError, TimeoutError, json.JSONDecodeError, ValueError):
+        return None
+
+    if not isinstance(payload, list) or not payload:
+        return None
+
+    latest = payload[0]
+    return {
+        "current_price": _to_float(latest.get("closePrice")),
+        "daily_change": _to_float(latest.get("compareToPreviousClosePrice")),
+        "daily_pct": _to_float(latest.get("fluctuationsRatio")),
+        "local_traded_at": latest.get("localTradedAt"),
+        "source": "Naver Index API",
+    }
 
 
 def build_price_chart(history: pd.DataFrame, forecast: pd.DataFrame) -> go.Figure:
@@ -128,7 +168,17 @@ def build_price_chart(history: pd.DataFrame, forecast: pd.DataFrame) -> go.Figur
 
 def app() -> None:
     st.set_page_config(page_title="KOSPI TRFM Forecast", layout="wide")
+
+    now = datetime.now()
+    next_minute = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
+    ms_to_next_minute = max(1000, int((next_minute - now).total_seconds() * 1000))
+    st_autorefresh(interval=ms_to_next_minute, key="kospi_minute_boundary_refresh")
+
     st.title("KOSPI TRFM Forecast Dashboard")
+    if st.button("현재가 새로고침"):
+        load_realtime_kospi_quote.clear()
+        st.rerun()
+    st.caption("현재가는 매 분 00초에 자동 갱신됩니다.")
 
     if not DATA_PATH.exists():
         st.error(f"데이터 파일을 찾을 수 없습니다: {DATA_PATH}")
@@ -148,6 +198,17 @@ def app() -> None:
             st.caption(f"마지막 업데이트: {parsed_dt:%Y-%m-%d %H:%M:%S}")
         except ValueError:
             st.caption(f"마지막 업데이트: {last_update}")
+
+    realtime_quote = load_realtime_kospi_quote()
+    if realtime_quote:
+        current_price = float(realtime_quote["current_price"])
+        daily_change = float(realtime_quote["daily_change"])
+        daily_pct = float(realtime_quote["daily_pct"])
+        traded_at = realtime_quote.get("local_traded_at")
+        if traded_at:
+            st.caption(f"실시간 현재가 기준일: {traded_at} (source: {realtime_quote['source']})")
+    else:
+        st.caption("실시간 현재가 조회 실패: 마지막 예측 데이터 값을 표시합니다.")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("현재 KOSPI", f"{current_price:,.2f}")
